@@ -16,12 +16,41 @@ extra-source-files:  README.md
 library
   hs-source-dirs:      src/api
   exposed-modules:     Control.Distributed.Taskell
+  other-modules:       Control.Distributed.Taskell.Task
   default-language:    Haskell2010
   build-depends:       base >= 4.7 && < 5
+                      , amqp
+                      , bytestring
+                      , configurator
+                      , store
+                      , text
+                      , th-utilities
+                      , uuid
+                      , stm
   ghc-options:         -Wall -O2
 
 executable taskell-node
   hs-source-dirs:      src/node
+  main-is:             Main.hs
+  other-modules:       Tasks
+  default-language:    Haskell2010
+  build-depends:        base >= 4.7 && < 5
+                      , amqp
+                      , bytestring
+                      , configurator
+                      , optparse-applicative
+                      , store
+                      , Taskell
+                      , text
+                      , uuid
+                      , unordered-containers
+                      , stm
+                      , stm-containers
+                      , focus
+  ghc-options:         -Wall -threaded -rtsopts -rdynamic
+
+executable taskell-example
+  hs-source-dirs:      src/example
   main-is:             Main.hs
   default-language:    Haskell2010
   build-depends:        base >= 4.7 && < 5
