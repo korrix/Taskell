@@ -1,123 +1,90 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 module Main where
 
-import Control.Monad
+import Prelude hiding (log)
 
-import qualified Data.Text as T
+import qualified Data.ByteString.Lazy   as BL
+import qualified STMContainers.Map      as STM
+import qualified Control.Concurrent.STM as STM
+import qualified Focus                  as STM.Focus
 
-import qualified Data.Configurator.Types as Cfg
-import Data.Configurator as Cfg
-
-import Network.AMQP
-import Data.Store
-import Data.UUID
-import qualified Data.ByteString.Lazy as BL
-import Data.HashMap.Strict ((!))
-import Options.Applicative
-
+import Control.Distributed.Taskell hiding (progress)
 import Control.Concurrent
-import qualified Control.Monad.STM as STM
-import qualified STMContainers.Map as STM
-import qualified Focus as STM.Focus
+import Control.Monad.Reader
+import Data.Monoid
 
-import Control.Distributed.Taskell
+import Data.UUID
 
 import Tasks
 
-type CurrentTasks = STM.Map UUID ThreadId 
-newtype Options = Options { configPath :: String } deriving Show
+atomically :: MonadIO m => STM.STM a -> m a
+atomically = liftIO . atomically
 
-decodeMsg :: Store a => Message -> IO a
-decodeMsg msg = decodeIO (BL.toStrict $ msgBody msg)
+type CurrentTasks = STM.Map UUID ThreadId
 
-processTask :: CurrentTasks -> Channel -> (Message, Envelope) -> IO ()
-processTask currentTasks taskChannel (msg, env) = do
-  let Just taskName = msgType msg
-  let Just taskId = msgID msg
-  let taskArgs = BL.toStrict $ msgBody msg
+abortHandler :: CurrentTasks -> ReaderT (Env (Message, Envelope)) IO ()
+abortHandler currentTasks = do
+  Env r log (msg, env) <- ask
+  deferAck r env
 
-  print $ T.append "Received task " taskId
-  (taskResultQueue, _, _) <- declareQueue taskChannel newQueue {
-      queueName = T.append taskId ".results"
-    , queueAutoDelete = True
-  }
+  let Just taskId = fromASCIIBytes $ BL.toStrict (msgBody msg)
+  log $ "Got abort for task " <> toText taskId
 
-  -- (taskErrorQueue, _, _) <- declareQueue taskChannel newQueue {
-  --   queueName = T.append taskId ".errors"
-  -- , queueAutoDelete = True
-  -- }
-
-  print $ T.append "Szatan czyste zło: " taskResultQueue 
-  taskThread <- forkIO $ do
-    putStrLn "Forking"
-    taskResult <- runTaskIO (registeredTasks ! taskName) taskArgs
-    _ <- publishMsg taskChannel "" taskResultQueue
-        newMsg {msgBody = BL.fromStrict taskResult, msgDeliveryMode = Just Persistent}
-    putStrLn "Responding with result"
-    return ()
-
-  let Just uuid = fromText taskId
-  STM.atomically $ STM.insert taskThread uuid currentTasks
-
-  ackEnv env
-
-processAbort :: CurrentTasks -> (Message, Envelope) -> IO ()
-processAbort currentTasks (msg, env) = do
-  TaskAbort taskId <- decodeMsg msg
-  abortCurrent <- STM.atomically $ STM.focus (\k -> return $ (k, STM.Focus.Remove)) taskId currentTasks
+  abortCurrent <- atomically $ STM.focus (\k -> return $ (k, STM.Focus.Remove)) taskId currentTasks
   case abortCurrent of
     Just threadId -> do
-       killThread threadId
-       putStrLn "Abort received, thread killed"
-    Nothing -> return ()
-  ackEnv env
+       liftIO $ killThread threadId
+       log "Abort received, thread killed"
+    Nothing -> log "Abort received, skipping"
 
-rabbitConnect :: Cfg.Config -> IO Connection
-rabbitConnect config = do
-  host     <- lookupDefault "localhost" config "taskell.rabbitmq.host"
-  vhost    <- lookupDefault "//"        config "taskell.rabbitmq.vhost"
-  username <- lookupDefault "guest"     config "taskell.rabbitmq.username"
-  password <- lookupDefault "password"  config "taskell.rabbitmq.password"
-  openConnection host vhost username password
 
-setupAborts :: CurrentTasks -> Cfg.Config -> Channel -> IO ConsumerTag
-setupAborts currentTasks config abortChannel = do
-  abortExchange <- lookupDefault "taskell.abort" config "taskell.abortExchange"
-  (abortQueue, _, _) <- declareQueue abortChannel newQueue {queueName = "", queueDurable = False, queueExclusive = True}
-  _ <- declareExchange abortChannel newExchange {exchangeName = abortExchange, exchangeType = "fanout"}
-  bindQueue abortChannel abortQueue abortExchange ""
-  consumeMsgs abortChannel abortQueue Ack $ processAbort currentTasks
+taskHandler :: Connection -> ReaderT (Env (Message, Envelope)) IO ()
+taskHandler conn = do
+  Env r log (msg, env) <- ask
+  deferAck r env
 
-setupTasks :: CurrentTasks -> Cfg.Config -> Connection -> IO [ConsumerTag]
-setupTasks currentTasks config connection = do
-  taskChannel <- openChannel connection
+  let Just taskId   = msgID msg
+  let Just taskName = msgType msg
+  let taskArgs      = msgBody msg
 
-  parallelism <- lookupDefault 1  config "taskell.parallelism"
-  qos taskChannel 0 parallelism True -- Defining how many tasks at once can be processed
-  queues <- lookupDefault ["taskell.tasks"] config "taskell.queues"
+  log $ "Processing task " <> taskId <> " of type " <> taskName
 
-  forM queues $ \queue -> do
-    putStrLn $ "Subscirbing " ++ T.unpack queue
-    taskManagementChannel <- openChannel connection
-    _ <- declareQueue taskChannel newQueue {queueName = queue}
-    consumeMsgs taskChannel queue Ack $ processTask currentTasks taskManagementChannel
+  (result, progress) <- atomically $ (,) <$> STM.newEmptyTMVar <*> STM.newEmptyTMVar
+
+  withConnection conn $
+    forM_ [(".result", result), (".progress", progress)] $ \(suffix, mvar) ->
+      channel (taskId <> suffix) 
+        $ queue newQueue {queueName = taskId <> suffix, queueAutoDelete = True}  
+        $ publishAsyncFrom mvar
+  
+  let save var = atomically . STM.putTMVar var
+  res <- runTaskByName registeredTasks taskName taskArgs (save progress . Just)
+  save progress Nothing
+  save result (Just res)
+  save result Nothing
+
+  return ()
 
 main :: IO ()
-main = 
-  let parser = Options <$> argument str (metavar "CONFIG_PATH")
-  in execParser (info parser mempty) >>= \(Options cp) -> do
-      config <- load [ Required cp ]
-      connection <- rabbitConnect config
-    
-      currentTasks <- STM.newIO
+main = do
+  currentTasks <- STM.newIO
+  logger defaultLoger $ connection "localhost" "/" "guest" "guest" $ do
+    channel "abort" $ do
+      abortEx <- exchange newExchange {exchangeName = "taskell.abort", exchangeType = "fanout"}
+      queue newQueue {queueName = "", queueDurable = False, queueExclusive = True} $ do
+        bindTo abortEx ""
+        subscribe Ack $ abortHandler currentTasks
 
-      abortChannel <- openChannel connection
-      _ <- setupAborts currentTasks config abortChannel
+    conn <- asks _res
+    channel "task" $ do
+      parallelism 1
+      forM_ ["taskell.q1", "taskell.q2"] $ \q ->
+        queue newQueue {queueName = q} $ do
+          subscribe Ack $ taskHandler conn
       
-      _ <- setupTasks currentTasks config connection
-    
-      _ <- getLine
-    
-      closeConnection connection
-    
+    liftIO $ do
+      putStrLn "Press any key to terminate..."
+      getLine
+      return ()
